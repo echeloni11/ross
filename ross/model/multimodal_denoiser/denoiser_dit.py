@@ -134,7 +134,7 @@ class DiT(nn.Module):
             DiTBlock(hidden_size, num_heads, mlp_ratio=mlp_ratio) for _ in range(depth)
         ])
         self.final_layer = FinalLayer(hidden_size, patch_size, self.out_channels)
-        self.initialize_weights()
+        # self.initialize_weights() # Don't want to initialize? cause some problems
 
     def initialize_weights(self):
         # Initialize transformer layers:

@@ -48,7 +48,8 @@ def load_pretrained_model(model_path, model_base, model_name, load_8bit=False, l
 
     if 'qwen2' in model_name.lower():
         print(f'=> loading RossQwen2ForCausalLM ...')
-        tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
+        tokenizer_path = "HaochenWang/ross-qwen2-7b" # checkpoint path is only for loading model
+        tokenizer = AutoTokenizer.from_pretrained(tokenizer_path, use_fast=False)
         model = RossQwen2ForCausalLM.from_pretrained(
             model_path,
             low_cpu_mem_usage=True,

@@ -926,7 +926,9 @@ class LazySupervisedDataset(Dataset):
                  data_args: DataArguments):
         super(LazySupervisedDataset, self).__init__()
         with megfile.smart_open(data_path, "r", encoding="utf-8") as file:
-            list_data_dict = json.load(file)
+            # list_data_dict = json.load(file)
+            lines = file.readlines()
+            list_data_dict = [json.loads(line) for line in lines]
 
         rank0_print("Formatting inputs...Skip in lazy mode")
         self.tokenizer = tokenizer
@@ -1055,6 +1057,8 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
 def train(attn_implementation="flash_attention_2"):
     global local_rank
 
+    print(torch.cuda.current_device())
+
     parser = transformers.HfArgumentParser(
         (ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
@@ -1083,12 +1087,53 @@ def train(attn_implementation="flash_attention_2"):
     if 'Qwen2' in model_args.model_name_or_path:
         model = RossQwen2ForCausalLM.from_pretrained(
             model_args.model_name_or_path,
-            cache_dir=training_args.cache_dir,
+            # cache_dir=training_args.cache_dir,
             attn_implementation=attn_implementation,
             torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
             **bnb_model_from_pretrained_args
         )
-    elif 'vicuna' or 'Llama-3' in model_args.model_name_or_path:
+        ### Modified here 250301
+        # need to load the weights of mm_projector and mm_inv_projector in RossQwen2 to the model
+        # I can only think of the way that
+        # load RossQwen2 as well and then load the weights of mm_projector to the model
+        # with deepspeed.zero.GatheredParameters(model.get_model().mm_projector.parameters(), modifier_rank=0)
+        # but it may not be the best way
+        import deepspeed
+        import gc
+        model_ross = RossQwen2ForCausalLM.from_pretrained(
+            "HaochenWang/ross-qwen2-7b",
+            attn_implementation=attn_implementation,
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            **bnb_model_from_pretrained_args
+        )
+
+        with deepspeed.zero.GatheredParameters(model_ross.get_model().mm_projector.parameters(), modifier_rank=0):
+            projector_state_dict = model_ross.get_model().mm_projector.state_dict()
+
+        with deepspeed.zero.GatheredParameters(model_ross.get_model().mm_inv_projector.parameters(), modifier_rank=0):
+            inv_projector_state_dict = model_ross.get_model().mm_inv_projector.state_dict()
+        
+        with deepspeed.zero.GatheredParameters(model.get_model().mm_projector.parameters(), modifier_rank=0):
+            model.get_model().mm_projector.load_state_dict(projector_state_dict)
+        
+        with deepspeed.zero.GatheredParameters(model.get_model().mm_inv_projector.parameters(), modifier_rank=0):
+            model.get_model().mm_inv_projector.load_state_dict(inv_projector_state_dict)
+        
+        del model_ross
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    ### Modified here 250228
+    # directly load ross-qwen2
+    elif 'ross' in model_args.model_name_or_path:
+        model = RossQwen2ForCausalLM.from_pretrained(
+            model_args.model_name_or_path,
+            # cache_dir=training_args.cache_dir,
+            attn_implementation=attn_implementation,
+            torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
+            **bnb_model_from_pretrained_args
+        )
+    elif 'vicuna' in model_args.model_name_or_path or 'Llama-3' in model_args.model_name_or_path:
         model = RossLlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
             cache_dir=training_args.cache_dir,
@@ -1151,15 +1196,35 @@ def train(attn_implementation="flash_attention_2"):
                 )
 
         if model_args.version in conversation_lib.conv_templates:
+            ### !!! Conversation version specified here!!!
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
             conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
 
-    if model_args.vision_tower is not None:
-        model.get_model().initialize_vision_modules(
-            model_args=model_args,
-            fsdp=training_args.fsdp,
-        )
+    if model_args.vision_tower is not None: # vision_tower implies multimodal
+
+        # here we directly load Ross and vision_tower is already loaded
+        # it's when use Qwen to load Ross that vision_tower would be None
+        # if model.get_model().vision_tower is None:
+        if getattr(model.get_model(), "vision_tower", None) is None:
+            # model.get_model().initialize_vision_modules(
+            #     model_args=model_args,
+            #     fsdp=training_args.fsdp,
+            # )
+            model.get_model().initialize_vision_modules_skip_projector(
+                model_args=model_args,
+                fsdp=training_args.fsdp,
+            )
+        else:
+        # but we still need to build pixel_decoder here
+            model.get_model().initialize_pixel_decoder( # pixel_decoder implies ross_enabled
+                model_args=model_args,
+                fsdp=training_args.fsdp,
+            )   ### 此时pixel_decoder还在cpu, 且格式是fp32, 也没有被partition
+                ### 不过pixel_decoder不需要训练/更新
+                ### 但好像还是需要挪到gpu上
+        if getattr(model.get_model(), "pixel_decoder", None) is not None:
+            model.get_model().pixel_decoder.to('cuda')
 
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
@@ -1219,6 +1284,7 @@ def train(attn_implementation="flash_attention_2"):
                         module = module.to(torch.bfloat16)
 
     total_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() for p in model.parameters())
+    trainable_param_names = [n for n, p in model.named_parameters() if p.requires_grad]
     train_params = sum(p.ds_numel if hasattr(p, "ds_numel") else p.numel() if p.requires_grad else 0 for p in model.parameters())
     print(f">> Total params: {total_params / 1.e6}M")
     print(f">> Train params: {train_params / 1.e6}M, Ratio {train_params / total_params * 100.:.2f}%")
@@ -1232,6 +1298,15 @@ def train(attn_implementation="flash_attention_2"):
         args=training_args,
         **data_module,
     )
+    # ### debug
+    # from callbacks import SubmoduleGradLogger
+    # trainer = RossTrainer(
+    #     model=model,
+    #     tokenizer=tokenizer,
+    #     args=training_args,
+    #     callbacks=[SubmoduleGradLogger()],
+    #     **data_module,
+    # )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)

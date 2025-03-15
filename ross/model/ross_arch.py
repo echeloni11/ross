@@ -54,12 +54,141 @@ class RossMetaModel:
                 self.image_newline = nn.Parameter(
                     torch.empty(config.hidden_size, dtype=self.dtype)
                 )
+        
+        ### Modified Code 250301
+        # when loading model from qwen2, the config does not have "mm_vision_tower"
+        # and not only vision tower but also mm_projector will not be initialized
+        # thus, we need to load the config of model_ross 
+        # and use this config to build model's mm_projector
+        # also, we need to do this inside init so that
+        # the projector can be partitioned by deepspeed zero3
+        else:
+            from ross.model import RossQwen2ForCausalLM
+            ross_config = RossQwen2ForCausalLM.config_class.from_pretrained("HaochenWang/ross-qwen2-7b")
+            self.mm_projector = build_vision_projector(ross_config)
+            self.mm_inv_projector = build_inv_projector(ross_config)
+        
+        ### Modified Code 250228
+        # initialize structures of pixel_decoder and mm_inv_projector
+        # so that from_pretrained can load the weights of these two modules
+        if getattr(config, "mm_pixel_decoder", False):
+            # self.pixel_decoder = build_pixel_decoder(config)
+            # NOTE pixel_decoder is using AutoencoderKL
+            # this is using from_pretrained from diffusers rather than transformers
+            # which does not support deepspeed zero3 !!!
+
+            # this limits the setting of config to pretrained default
+            # can't change config according to model_args
+            # if need different model_args need to use initialize_vision_modules
+            if getattr(self, "mm_inv_projector", None) is None:
+                self.mm_inv_projector = build_inv_projector(config)
 
     def get_vision_tower(self):
         vision_tower = getattr(self, 'vision_tower', None)
         if type(vision_tower) is list:
             vision_tower = vision_tower[0]
         return vision_tower
+
+    def initialize_pixel_decoder(self, model_args, fsdp=None):
+        self.config.ross_enable = False
+        if getattr(model_args, 'mm_pixel_decoder', False):
+            self.config.ross_enable = True
+            # if self.pixel_decoder is None:
+            if getattr(self, 'pixel_decoder', None) is None:
+                self.pixel_decoder = build_pixel_decoder(self.config)
+
+        # set some attributes as in initialize_vision_modules,
+        # but don't initialize those modules as they are already loaded
+        self.image_embed_len = (self.vision_tower.config.image_size // self.vision_tower.config.patch_size) ** 2
+
+    def initialize_vision_modules_skip_projector(self, model_args, fsdp=None):
+        vision_tower = model_args.vision_tower
+        mm_vision_select_layer = model_args.mm_vision_select_layer
+        mm_vision_select_feature = model_args.mm_vision_select_feature
+        pretrain_mm_mlp_adapter = model_args.pretrain_mm_mlp_adapter
+        mm_patch_merge_type = model_args.mm_patch_merge_type
+
+        # for pixel_decoder
+        mm_pixel_decoder = model_args.mm_pixel_decoder
+        pretrain_mm_inv_mlp_adapter = model_args.pretrain_mm_inv_mlp_adapter
+
+        self.config.mm_vision_tower = vision_tower
+        self.config.mm_pixel_decoder = mm_pixel_decoder
+
+        if self.get_vision_tower() is None:
+            vision_tower = build_vision_tower(model_args)
+
+            if fsdp is not None and len(fsdp) > 0:
+                self.vision_tower = [vision_tower]
+            else:
+                self.vision_tower = vision_tower
+        else:
+            if fsdp is not None and len(fsdp) > 0:
+                vision_tower = self.vision_tower[0]
+            else:
+                vision_tower = self.vision_tower
+            vision_tower.load_model()
+        self.image_embed_len = (self.vision_tower.config.image_size // self.vision_tower.config.patch_size) ** 2
+        self.config.image_embed_len = self.image_embed_len
+        self.config.image_mean = self.vision_tower.image_processor.image_mean
+        self.config.image_std = self.vision_tower.image_processor.image_std
+        self.config.decode_image_size = self.vision_tower.config.image_size // self.vision_tower.config.patch_size * 16  # 336 -> 384; 384 -> 432
+
+        ### build CLIP-LLM projector
+        self.config.use_mm_proj = True
+        self.config.mm_projector_type = getattr(model_args, 'mm_projector_type', 'linear')
+        self.config.mm_hidden_size = vision_tower.hidden_size
+        self.config.mm_vision_select_layer = mm_vision_select_layer
+        self.config.mm_vision_select_feature = mm_vision_select_feature
+        self.config.mm_patch_merge_type = mm_patch_merge_type
+
+        if getattr(self, 'mm_projector', None) is None:
+            self.mm_projector = build_vision_projector(self.config)
+
+            if 'unpad' in mm_patch_merge_type:
+                embed_std = 1 / torch.sqrt(torch.tensor(self.config.hidden_size, dtype=self.dtype))
+                self.image_newline = nn.Parameter(
+                    torch.randn(self.config.hidden_size, dtype=self.dtype) * embed_std
+                )
+        else:
+            # In case it is frozen by LoRA
+            for p in self.mm_projector.parameters():
+                p.requires_grad = True
+
+        # if pretrain_mm_mlp_adapter is not None:
+        #     print(f"=> loading pretrain_mm_mlp_adapter from {pretrain_mm_mlp_adapter} ...")
+        #     mm_projector_weights = torch.load(pretrain_mm_mlp_adapter, map_location='cpu')
+
+        #     def get_w(weights, keyword):
+        #         return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+
+        #     self.mm_projector.load_state_dict(get_w(mm_projector_weights, 'mm_projector'))
+
+        self.config.ross_enable = False
+        if getattr(model_args, 'mm_pixel_decoder', False):
+            self.config.ross_enable = True
+            ### build pixel decoder
+            self.pixel_decoder = build_pixel_decoder(self.config)
+            self.config.mm_inv_hidden_size = self.pixel_decoder.latent_dim
+
+            ### build LLM-CLIP projector
+            self.config.use_mm_inv_proj = True
+            self.config.mm_inv_projector_type = getattr(model_args, 'mm_inv_projector_type', 'linear')
+
+            if getattr(self, 'mm_inv_projector', None) is None:
+                self.mm_inv_projector = build_inv_projector(self.config)
+            else:
+                # In case it is frozen by LoRA
+                for p in self.mm_inv_projector.parameters():
+                    p.requires_grad = True
+            # if pretrain_mm_inv_mlp_adapter is not None:
+            #     print(f"=> loading pretrain_mm_inv_mlp_adapter from {pretrain_mm_inv_mlp_adapter} ...")
+            #     mm_inv_projector_weights = torch.load(pretrain_mm_inv_mlp_adapter, map_location='cpu')
+
+            #     def get_w(weights, keyword):
+            #         return {k.split(keyword + '.')[1]: v for k, v in weights.items() if keyword in k}
+
+            #     self.mm_inv_projector.load_state_dict(get_w(mm_inv_projector_weights, 'mm_inv_projector'))
 
     def initialize_vision_modules(self, model_args, fsdp=None):
         vision_tower = model_args.vision_tower

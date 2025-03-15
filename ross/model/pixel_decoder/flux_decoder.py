@@ -7,7 +7,16 @@ class FluxDecoder(nn.Module):
         super().__init__()
         self.config = config
 
-        self.pixel_decoder = AutoencoderKL.from_pretrained(config.mm_pixel_decoder)
+        # self.pixel_decoder = AutoencoderKL.from_pretrained(config.mm_pixel_decoder)
+
+        necessary_kwargs_for_from_pretrained_of_diffusers = {
+            'low_cpu_mem_usage': False,
+        }
+        self.pixel_decoder = AutoencoderKL.from_pretrained(
+            config.mm_pixel_decoder, 
+            **necessary_kwargs_for_from_pretrained_of_diffusers
+        )
+
         self.pixel_decoder.requires_grad_(False)
         self.pixel_decoder.float()
         self.pixel_decoder.eval()

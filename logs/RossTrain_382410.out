@@ -1,0 +1,14 @@
+Running 
+no change     /opt/conda/condabin/conda
+no change     /opt/conda/bin/conda
+no change     /opt/conda/bin/conda-env
+no change     /opt/conda/bin/activate
+no change     /opt/conda/bin/deactivate
+no change     /opt/conda/etc/profile.d/conda.sh
+no change     /opt/conda/etc/fish/conf.d/conda.fish
+no change     /opt/conda/shell/condabin/Conda.psm1
+no change     /opt/conda/shell/condabin/conda-hook.ps1
+no change     /opt/conda/lib/python3.12/site-packages/xontrib/conda.xsh
+no change     /opt/conda/etc/profile.d/conda.csh
+no change     /home/hanyim/.bashrc
+No action taken.
